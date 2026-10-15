@@ -132,6 +132,12 @@ impl FlussTestingClusterBuilder {
 
     pub fn with_remote_data_dir(mut self, dir: std::path::PathBuf) -> Self {
         std::fs::create_dir_all(&dir).expect("Failed to create remote data directory");
+        // The coordinator persists this directory in table/partition metadata,
+        // which tablet servers use for uploads. Both must share the same path.
+        self.cluster_conf.insert(
+            "remote.data.dir".to_string(),
+            dir.to_string_lossy().to_string(),
+        );
         self.remote_data_dir = Some(dir);
         self
     }
@@ -407,6 +413,12 @@ impl FlussTestingClusterBuilder {
             image = image.with_mapped_port(plain_port, ContainerPort::Tcp(plain_port));
         }
 
+        if let Some(ref remote_data_dir) = self.remote_data_dir {
+            use testcontainers::core::Mount;
+            let path = remote_data_dir.to_string_lossy().to_string();
+            image = image.with_mount(Mount::bind_mount(path.clone(), path));
+        }
+
         image.start().await.unwrap()
     }
 
@@ -446,12 +458,6 @@ impl FlussTestingClusterBuilder {
         tablet_server_confs.insert("internal.listener.name", "INTERNAL".to_string());
         tablet_server_confs.insert("tablet-server.id", tablet_server_id);
 
-        if let Some(remote_data_dir) = &self.remote_data_dir {
-            tablet_server_confs.insert(
-                "remote.data.dir",
-                remote_data_dir.to_string_lossy().to_string(),
-            );
-        }
         let mut image = GenericImage::new(&self.image, &self.image_tag)
             .with_cmd(vec!["tabletServer"])
             .with_mapped_port(expose_host_port, ContainerPort::Tcp(port))
@@ -659,5 +665,43 @@ async fn stop_cluster_async(name: &str) {
                 force_remove_container(&docker, cname).await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remote_data_dir_is_in_shared_server_configuration() {
+        let dir = std::env::temp_dir();
+        let builder =
+            FlussTestingClusterBuilder::new("remote-dir-config").with_remote_data_dir(dir.clone());
+
+        assert_eq!(builder.remote_data_dir.as_ref(), Some(&dir));
+        // Both coordinator and tablet server properties include cluster_conf.
+        let properties = builder.to_fluss_properties_with(HashMap::new());
+        assert!(
+            properties
+                .lines()
+                .any(|line| { line == format!("remote.data.dir: {}", dir.to_string_lossy()) })
+        );
+    }
+
+    #[test]
+    fn remote_data_dir_overrides_existing_cluster_configuration() {
+        let conf = HashMap::from([("remote.data.dir".to_string(), "/old-remote-dir".to_string())]);
+        let dir = std::env::temp_dir();
+        let builder =
+            FlussTestingClusterBuilder::new_with_cluster_conf("remote-dir-override", &conf)
+                .with_remote_data_dir(dir.clone());
+
+        assert_eq!(
+            builder
+                .cluster_conf
+                .get("remote.data.dir")
+                .map(String::as_str),
+            Some(dir.to_string_lossy().as_ref())
+        );
     }
 }
